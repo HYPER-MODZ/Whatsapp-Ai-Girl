@@ -324,12 +324,16 @@ async function startBot() {
 
                     const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
 
-                    // Ask user for connection method if not specified in command line
-                    // Skip asking for connection method if we just paired successfully
+                    // Use environment variables for connection method if available
+                    // In the startBot function, update the connection method determination
                     let connectionMethod = 'qr';
                     if (justPaired) {
                         console.log('Reconnecting after successful pairing...');
                         // Use QR method which will automatically use saved credentials
+                    } else if (process.env.CONNECTION_METHOD) {
+                        // Use environment variable for connection method
+                        connectionMethod = process.env.CONNECTION_METHOD.toLowerCase() === 'true' ? 'pair' : 'qr';
+                        console.log(`Using connection method from environment: ${connectionMethod}`);
                     } else if (usePairingCode) {
                         connectionMethod = 'pair';
                     } else {
@@ -349,9 +353,9 @@ async function startBot() {
                         maxRetries: 5
                     });
 
-                    // If pairing code method is selected, request a pairing code
+                    // If pairing code method is selected, use environment variable or prompt
                     if (connectionMethod === 'pair') {
-                        await handlePairingCode(sock);
+                        await handlePairingCodeWithEnv(sock);
                     }
 
                     sock.ev.on('connection.update', async (update) => {
@@ -486,6 +490,108 @@ async function startBot() {
     }
 }
 
+
+// Add this function to handle the pairing code process with environment variable
+// Modify the handlePairingCodeWithEnv function to wait for connection
+async function handlePairingCodeWithEnv(sock) {
+    try {
+        // Check if phone number is provided in environment variable
+        if (process.env.CONNECTION_NUMBER) {
+            const phoneNumber = process.env.CONNECTION_NUMBER.replace(/[^0-9]/g, '');
+            console.log(`Using phone number from environment: +${phoneNumber}`);
+            
+            // Wait for connection to be established before requesting pairing code
+            return new Promise((resolve) => {
+                // Set up a one-time connection update listener specifically for this purpose
+                const connectionListener = async (update) => {
+                    const { connection } = update;
+                    
+                    // Only proceed when we have an open connection
+                    if (connection === 'open') {
+                        // Remove this listener to avoid duplicates
+                        sock.ev.off('connection.update', connectionListener);
+                        resolve();
+                    } else if (connection === 'connecting') {
+                        console.log('Connecting to WhatsApp servers, please wait...');
+                    }
+                };
+                
+                // Listen for connection updates
+                sock.ev.on('connection.update', connectionListener);
+                
+                // Also set a timeout in case connection never establishes
+                setTimeout(() => {
+                    sock.ev.off('connection.update', connectionListener);
+                    console.log('Attempting to request pairing code now...');
+                    
+                    // Try to request the pairing code after timeout
+                    sock.requestPairingCode(phoneNumber)
+                        .then(code => {
+                            console.log('\n╔═══════════════════════════════════════╗');
+                            console.log('║                                       ║');
+                            console.log(`║   Pairing Code: ${code}   ║`);
+                            console.log('║                                       ║');
+                            console.log('╚═══════════════════════════════════════╝\n');
+                            console.log('1. Open WhatsApp on your phone');
+                            console.log('2. Go to Settings > Linked Devices > Link a Device');
+                            console.log('3. When the QR code scanner appears, tap "Link with phone number"');
+                            console.log(`4. Enter the pairing code: ${code}`);
+                            console.log('\nWaiting for connection...');
+                            resolve();
+                        })
+                        .catch(err => {
+                            console.error('Error requesting pairing code after timeout:', err);
+                            resolve(); // Resolve anyway to continue the flow
+                        });
+                }, 5000); // Wait 5 seconds before attempting to request code
+            });
+        } else {
+            // Fall back to terminal input if environment variable is not set
+            await handlePairingCode(sock);
+        }
+    } catch (error) {
+        console.error('Error in pairing code process:', error);
+        // Don't throw, just log the error and continue
+    }
+}
+
+// Keep the original handlePairingCode function as a fallback
+async function handlePairingCode(sock) {
+    const readline = require('readline').createInterface({
+        input: process.stdin,
+        output: process.stdout
+    });
+    
+    return new Promise((resolve, reject) => {
+        readline.question('Enter your WhatsApp number (with country code, e.g., 1XXXXXXXXXX): ', async (number) => {
+            try {
+                // Remove any non-numeric characters from the input
+                const phoneNumber = number.replace(/[^0-9]/g, '');
+                
+                console.log(`Requesting pairing code for +${phoneNumber}...`);
+                const code = await sock.requestPairingCode(phoneNumber);
+                
+                console.log('\n╔═══════════════════════════════════════╗');
+                console.log('║                                       ║');
+                console.log(`║   Pairing Code: ${code}   ║`);
+                console.log('║                                       ║');
+                console.log('╚═══════════════════════════════════════╝\n');
+                console.log('1. Open WhatsApp on your phone');
+                console.log('2. Go to Settings > Linked Devices > Link a Device');
+                console.log('3. When the QR code scanner appears, tap "Link with phone number"');
+                console.log(`4. Enter the pairing code: ${code}`);
+                console.log('\nWaiting for connection...');
+                
+                readline.close();
+                resolve();
+            } catch (error) {
+                console.error('Error requesting pairing code:', error);
+                readline.close();
+                reject(error);
+            }
+        });
+    });
+}
 
 // Modify the checkExpiredPremiumUsers function to accept sock as a parameter
 // Add this function to check for expired premium users
