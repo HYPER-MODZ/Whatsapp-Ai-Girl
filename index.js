@@ -263,7 +263,7 @@ async function handlePairingCode(sock) {
 // Add this variable at the top level, after the userStates declaration
 let justPaired = false;
 
-// Modify the startBot function to handle reconnection after pairing
+// Modify the startBot function to check for existing session files
 async function startBot() {
     try {
         console.log('Starting bot...');
@@ -323,13 +323,39 @@ async function startBot() {
                     console.log(`Connection attempt ${connectionAttempts}/${maxAttempts}...`);
 
                     const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
-
+                    
+                    // Add this function to check if we have valid session files
+                    async function checkValidSession(state) {
+                        try {
+                            // Check if we have creds.json which indicates a valid session
+                            const authFolder = path.join(process.cwd(), 'auth_info_baileys');
+                            const credsPath = path.join(authFolder, 'creds.json');
+                            
+                            if (await fs.pathExists(credsPath)) {
+                                // Check if the file has content
+                                const stats = await fs.stat(credsPath);
+                                if (stats.size > 0) {
+                                    return true;
+                                }
+                            }
+                            return false;
+                        } catch (error) {
+                            console.error('Error checking session validity:', error);
+                            return false;
+                        }
+                    }
+                    
+                    // Add this line before using hasValidSession
+                    const hasValidSession = await checkValidSession(state);
+                    
                     // Use environment variables for connection method if available
-                    // In the startBot function, update the connection method determination
                     let connectionMethod = 'qr';
                     if (justPaired) {
                         console.log('Reconnecting after successful pairing...');
                         // Use QR method which will automatically use saved credentials
+                    } else if (hasValidSession) {
+                        console.log('Valid session files found, using existing credentials');
+                        connectionMethod = 'qr'; // Use QR method which will automatically use saved credentials
                     } else if (process.env.CONNECTION_METHOD) {
                         // Use environment variable for connection method
                         connectionMethod = process.env.CONNECTION_METHOD.toLowerCase() === 'true' ? 'pair' : 'qr';
@@ -492,7 +518,7 @@ async function startBot() {
 
 
 // Add this function to handle the pairing code process with environment variable
-// Modify the handlePairingCodeWithEnv function to wait for connection
+// Improve the handlePairingCodeWithEnv function to wait for connection
 async function handlePairingCodeWithEnv(sock) {
     try {
         // Check if phone number is provided in environment variable
@@ -502,31 +528,27 @@ async function handlePairingCodeWithEnv(sock) {
             
             // Wait for connection to be established before requesting pairing code
             return new Promise((resolve) => {
-                // Set up a one-time connection update listener specifically for this purpose
+                let connectionState = 'connecting';
+                let pairingRequested = false;
+                
+                // Set up a connection update listener
                 const connectionListener = async (update) => {
                     const { connection } = update;
                     
+                    if (connection) {
+                        connectionState = connection;
+                    }
+                    
                     // Only proceed when we have an open connection
-                    if (connection === 'open') {
+                    if (connectionState === 'open' && !pairingRequested) {
+                        pairingRequested = true;
                         // Remove this listener to avoid duplicates
                         sock.ev.off('connection.update', connectionListener);
-                        resolve();
-                    } else if (connection === 'connecting') {
-                        console.log('Connecting to WhatsApp servers, please wait...');
-                    }
-                };
-                
-                // Listen for connection updates
-                sock.ev.on('connection.update', connectionListener);
-                
-                // Also set a timeout in case connection never establishes
-                setTimeout(() => {
-                    sock.ev.off('connection.update', connectionListener);
-                    console.log('Attempting to request pairing code now...');
-                    
-                    // Try to request the pairing code after timeout
-                    sock.requestPairingCode(phoneNumber)
-                        .then(code => {
+                        
+                        try {
+                            console.log('Connection established, requesting pairing code...');
+                            const code = await sock.requestPairingCode(phoneNumber);
+                            
                             console.log('\n╔═══════════════════════════════════════╗');
                             console.log('║                                       ║');
                             console.log(`║   Pairing Code: ${code}   ║`);
@@ -537,13 +559,47 @@ async function handlePairingCodeWithEnv(sock) {
                             console.log('3. When the QR code scanner appears, tap "Link with phone number"');
                             console.log(`4. Enter the pairing code: ${code}`);
                             console.log('\nWaiting for connection...');
-                            resolve();
-                        })
-                        .catch(err => {
-                            console.error('Error requesting pairing code after timeout:', err);
-                            resolve(); // Resolve anyway to continue the flow
-                        });
-                }, 5000); // Wait 5 seconds before attempting to request code
+                        } catch (err) {
+                            console.error('Error requesting pairing code:', err);
+                        }
+                        
+                        resolve();
+                    } else if (connectionState === 'connecting') {
+                        console.log('Connecting to WhatsApp servers, please wait...');
+                    }
+                };
+                
+                // Listen for connection updates
+                sock.ev.on('connection.update', connectionListener);
+                
+                // Also set a timeout in case connection never establishes
+                setTimeout(() => {
+                    if (!pairingRequested) {
+                        sock.ev.off('connection.update', connectionListener);
+                        console.log('Connection timeout reached, attempting to request pairing code anyway...');
+                        
+                        // Try to request the pairing code after timeout
+                        sock.requestPairingCode(phoneNumber)
+                            .then(code => {
+                                console.log('\n╔═══════════════════════════════════════╗');
+                                console.log('║                                       ║');
+                                console.log(`║   Pairing Code: ${code}   ║`);
+                                console.log('║                                       ║');
+                                console.log('╚═══════════════════════════════════════╝\n');
+                                console.log('1. Open WhatsApp on your phone');
+                                console.log('2. Go to Settings > Linked Devices > Link a Device');
+                                console.log('3. When the QR code scanner appears, tap "Link with phone number"');
+                                console.log(`4. Enter the pairing code: ${code}`);
+                                console.log('\nWaiting for connection...');
+                                pairingRequested = true;
+                                resolve();
+                            })
+                            .catch(err => {
+                                console.error('Error requesting pairing code after timeout:', err);
+                                resolve(); // Resolve anyway to continue the flow
+                            });
+                    }
+                }, 15000); // Increased from 5000 to 15000 (15 seconds)
             });
         } else {
             // Fall back to terminal input if environment variable is not set
@@ -664,8 +720,11 @@ async function checkExpiredPremiumUsers(sock) {
     }
 }
 
-// Add this variable to track previous license status
+// Add these variables to track notification status
 let previousLicenseStatus = null;
+let licenseExpiryNotificationSent = false;
+let licenseInvalidNotificationSent = false;
+let lastNotificationDay = 0; // Track the day when notification was last sent
 
 // Add this function to check license status
 async function checkLicenseStatus(sock) {
@@ -680,6 +739,15 @@ async function checkLicenseStatus(sock) {
         const currentStatus = status.success && status.registered ? 
             (status.license_info.status || 'unknown') : 'invalid';
         
+        // Get current day to track daily notifications
+        const currentDay = new Date().getDate();
+        // Reset notification flags if it's a new day
+        if (currentDay !== lastNotificationDay) {
+            licenseExpiryNotificationSent = false;
+            licenseInvalidNotificationSent = false;
+            lastNotificationDay = currentDay;
+        }
+        
         // Check if license just expired (was active before, now expired)
         if (previousLicenseStatus === 'active' && currentStatus === 'expired') {
             console.log('License just expired! Sending immediate notification to owner');
@@ -687,7 +755,13 @@ async function checkLicenseStatus(sock) {
             // Send immediate notification to bot owner
             if (botOwner) {
                 await sock.sendMessage(botOwner, { 
-                    text: `🚨 *URGENT: Bot License Expired* 🚨\n\nYour bot license has just expired. The bot will not process messages from users until a new license is purchased.\n\nPlease purchase a new license key and register using the command "/register YOUR-LICENSE-KEY".\n\nTo purchase a key, please contact the bot creator at: wa.me/94767043432` 
+                    text: `🚨 *URGENT: Bot License Expired* 🚨
+
+Your bot license has just expired. The bot will not process messages from users until a new license is purchased.
+
+Please purchase a new license key and register using the command "/register YOUR-LICENSE-KEY".
+
+To purchase a key, please contact the bot creator at: wa.me/94767043432` 
                 });
             }
         }
@@ -695,14 +769,21 @@ async function checkLicenseStatus(sock) {
         // Update previous status for next check
         previousLicenseStatus = currentStatus;
         
-        if (!status.success || !status.registered) {
+        if ((!status.success || !status.registered) && !licenseInvalidNotificationSent) {
             console.log('Bot is not registered or license is invalid');
             
             // Notify the bot owner
             if (botOwner) {
                 await sock.sendMessage(botOwner, { 
-                    text: `⚠️ *Bot License Alert* ⚠️\n\nYour bot is not registered or the license has expired. The bot will not process messages from users until registered with a valid license.\n\nUse the command "/register YOUR-LICENSE-KEY" to register the bot.\n\nTo purchase a key, please contact the bot creator at: wa.me/94767043432` 
+                    text: `⚠️ *Bot License Alert* ⚠️
+
+Your bot is not registered or the license has expired. The bot will not process messages from users until registered with a valid license.
+
+Use the command "/register YOUR-LICENSE-KEY" to register the bot.
+
+To purchase a key, please contact the bot creator at: wa.me/94767043432` 
                 });
+                licenseInvalidNotificationSent = true;
             }
             
             return false;
@@ -714,12 +795,17 @@ async function checkLicenseStatus(sock) {
             const now = new Date();
             const daysUntilExpiry = Math.floor((expiryDate - now) / (1000 * 60 * 60 * 24));
             
-            if (daysUntilExpiry <= 3 && daysUntilExpiry > 0) {
+            if (daysUntilExpiry <= 3 && daysUntilExpiry > 0 && !licenseExpiryNotificationSent) {
                 // Notify the bot owner about upcoming expiration
                 if (botOwner) {
                     await sock.sendMessage(botOwner, { 
-                        text: `⚠️ *License Expiring Soon* ⚠️\n\nYour bot license will expire in ${daysUntilExpiry} day${daysUntilExpiry > 1 ? 's' : ''}. Please generate a new license to avoid service interruption.\n\nTo purchase a key, please contact the bot creator at: wa.me/94767043432` 
+                        text: `⚠️ *License Expiring Soon* ⚠️
+
+Your bot license will expire in ${daysUntilExpiry} day${daysUntilExpiry > 1 ? 's' : ''}. Please generate a new license to avoid service interruption.
+
+To purchase a key, please contact the bot creator at: wa.me/94767043432` 
                     });
+                    licenseExpiryNotificationSent = true;
                 }
             }
         }
